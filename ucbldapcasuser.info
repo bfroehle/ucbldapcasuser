@@ -1,0 +1,8 @@
+; $Id$
+name = UCB CAS User
+package = LDAP integration
+description = Allows administrators to create new CAS users.
+core = 6.x
+dependencies[] = ldapauth
+dependencies[] = cas
+dependencies[] = ldapcas

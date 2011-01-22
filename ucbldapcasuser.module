@@ -1,0 +1,292 @@
+<?php
+
+/**
+ * @file
+ * Used to easily create new CAS users and assign them permissions.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function ucbldapcasuser_menu() {
+  $items['admin/user/user/cas'] = array(
+    'title' => 'Add CAS user',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ucbldapcasuser_lookup'),
+    'access arguments' => array('administer users'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+}
+
+/**
+ * Creates a multistage CAS user lookup and create form.
+ *
+ * Stage 1:
+ * - Present a form which asks the user for a query format and query string.
+ *   The format can be "Last, First", "Last", and "UID".
+ *
+ * Stage 2:
+ * - Present a form which, given the results of an LDAP query on the stage 1
+ *   submission, provides checkboxes for each user result and all user roles.
+ *   Upon submission, the selected users will be created with the checked user
+ *   roles.
+ */
+function ucbldapcasuser_lookup(&$form_state) {
+  // ucbldapcasuser_lookup_validate processes the stage 1 submission and sets
+  // $form_state['entries'] to the results of the LDAP query.
+  if (!isset($form_state['entries'])) {
+    // Stage 1: Present search form.
+    $form['search_type'] = array(
+      '#type' => 'select',
+      '#title' => t('Search on'),
+      '#default_value' => 'cn',
+      '#options' => array(
+        'cn' => t('Last, First'),
+        'sn' => t('Last'),
+        'uid' => t('uid'),
+      ),
+    );
+    $form['search_base'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Name'),
+      '#default_value' => isset($form_state['values']['name']) ? $form_state['values']['name'] : '',
+      '#description' => 'Name to lookup in the LDAP database.',
+    );
+    $form['search'] = array(
+      '#type' => 'submit',
+      '#value' => t('Search'),
+    );
+  }
+  else {
+    // Stage 2:
+    // $form_state['entries'] contains a list of uid's and cn's from the LDAP query.
+    $entries = $form_state['entries'];
+    $form['cas_uids'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Users'),
+      '#tree' => TRUE,
+    );
+    foreach ($entries as $entry) {
+      if (is_array($entry)) {
+        $cas_uid = $entry['uid'][0];
+        $common_name = $entry['cn'][0];
+        $form['cas_uids'][$cas_uid] = array(
+          '#type' => 'checkbox',
+          '#title' => $common_name,
+        );
+        // Prevent users from attempting to create accounts of users who already exist.
+        if ($uid = _ucbldapcasuser_cas_uid_exists($cas_uid)) {
+          $form['cas_uids'][$cas_uid]['#disabled'] = TRUE;
+          $form['cas_uids'][$cas_uid]['#default_value'] = FALSE;
+          $form['cas_uids'][$cas_uid]['#description']  = t('User already exists. <a href="@url">Edit user</a>', array('@url' => url("user/$uid/edit")));
+        }
+      }
+    }
+
+    // This is mostly taken from user.module, to provide an interface
+    // consistent with the user edit form.
+    $form['roles_fieldset'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Roles'),
+    );
+    $roles = user_roles(TRUE);
+    // The disabled checkbox subelement for the 'authenticated user' role
+    // must be generated separately and added to the checkboxes element,
+    // because of a limitation in D6 FormAPI not supporting a single disabled
+    // checkbox within a set of checkboxes.
+    // TODO: This should be solved more elegantly. See issue #119038.
+    $checkbox_authenticated = array(
+      '#type' => 'checkbox',
+      '#title' => $roles[DRUPAL_AUTHENTICATED_RID],
+      '#default_value' => TRUE,
+      '#disabled' => TRUE,
+    );
+    unset($roles[DRUPAL_AUTHENTICATED_RID]);
+    $form['roles_fieldset']['roles'] = array(
+      '#type' => 'checkboxes',
+      '#default_value' => array_keys(_ucbldapcasuser_cas_roles()),
+      '#options' => $roles,
+      DRUPAL_AUTHENTICATED_RID => $checkbox_authenticated,
+    );
+
+    $form['create'] = array(
+      '#type' => 'submit',
+      '#value' => t('Create users'),
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Validate ucbldapcasuser_lookup() form submissions.
+ *
+ * This is a multipage submission form.  Each step us uniquely identified
+ * by the buttom used for submission.
+ *
+ * In stage 1, we query the LDAP server using the form submission values. We
+ * proceed to stage 2 if there is at least one valid user result.
+ *
+ * In stage 2, we verify at least one user was selected.
+ */
+function ucbldapcasuser_lookup_validate($form, &$form_state) {
+  if ($form_state['clicked_button']['#value'] == t('Search')) {
+    // Stage 1: Search for users
+    $ldap_server = 'ldap.berkeley.edu';
+    $ldap_port = 389;
+    $base_dn = 'ou=people,dc=berkeley,dc=edu';
+
+    // Generate the query string.
+    switch ($form_state['values']['search_type']) {
+      case 'cn':
+        $filter = 'cn=' . $form_state['values']['search_base'] . '*';
+        break;
+      default:
+        $filter = $form_state['values']['search_type'] . '=' . $form_state['values']['search_base'];
+        break;
+    }
+
+    // Connect to the LDAP server.
+    $ldap_connection = ldap_connect($ldap_server, $ldap_port);
+    if (!$ldap_connection) {
+      form_set_error('search_base', t('LDAP Connect failure to @server:@port', array('@server' => $ldap_server, '@port' => $ldap_port)));
+      return;
+    }
+
+    // Query the LDAP server.
+    $ldap_result = ldap_search($ldap_connection, $base_dn, $filter, array('uid', 'cn'));
+    if (ldap_count_entries($ldap_connection, $ldap_result) == 0) {
+      form_set_error('search_base', t('LDAP returned no entries for @filter on @server:@port', array('@filter' => $filter, '@server' => $ldap_server, '@port' => $ldap_port)));
+      return;
+    }
+
+    // Save the LDAP results for use in stage 2.
+    $form_state['entries'] = ldap_get_entries($ldap_connection, $ldap_result);
+    return;
+  }
+  elseif ($form_state['clicked_button']['#value'] == t('Create users')) {
+    // Stage 2: Create new users.
+    // Ensure that at least one checkbox is selected.
+    if (!array_filter($form_state['values']['cas_uids'])) {
+      form_set_error('cas_uids', t('You must select at least one user.'));
+    }
+  }
+  else {
+    // Should not be possible to get here.
+    form_set_error('error', t('Error in form submission logic.'));
+  }
+}
+
+/**
+ * Handle ucbldapcasuser_lookup() form submissions.
+ *
+ * Form has two stages.  In the first stage, set the form to be rebuilt to
+ * proceed to the second stage.  In the second stage, create the selected
+ * users with the specified roles.
+ */
+function ucbldapcasuser_lookup_submit($form, &$form_state) {
+  if ($form_state['clicked_button']['#value'] == t('Search')) {
+    // Stage 1 submission:
+    // The validate function already did all of the heavy lifting, just set
+    // the form to be rebuilt.
+    $form_state['rebuild'] = TRUE;
+  }
+  else {
+    // Stage 2 submission:
+    // Gather of list of selected users and roles.
+    $cas_uids = array_filter($form_state['values']['cas_uids']);
+    $cas_roles = array_filter($form_state['values']['roles']);
+
+    // Create each user and assign the selected roles.
+    foreach (array_keys($cas_uids) as $cas_uid) {
+      _ucbldapcasuser_cas_create_user($cas_uid, $cas_roles);
+    }
+
+    // Redirect to the user administration page.
+    $form_state['redirect'] = 'admin/user/user';
+  }
+}
+
+/**
+ * Determine if a specified CAS username already has an account.
+ *
+ * @param $cas_uid
+ *   A string containing the CAS username.
+ *
+ * @return
+ *   The Drupal uid if the CAS username already has a Drupal account, NULL
+ *   otherwise.
+ */
+function _ucbldapcasuser_cas_uid_exists($cas_uid) {
+  $cas_authmap = variable_get('cas_authmap', 0);
+  cas_invoke_auth_transform($cas_uid);
+
+  if (!$cas_authmap) {
+    $result = db_query("SELECT uid FROM {authmap} WHERE authname = '%s'", $cas_uid);
+    if ($user = db_fetch_array($result)) {
+      return $user['uid'];
+    }
+  }
+  if ($cas_authmap || variable_get('cas_hijack_user', 0)) {
+    $result = db_query("SELECT uid FROM {users} WHERE name = '%s'", $cas_uid);
+    if ($user = db_fetch_array($result)) {
+      return $user['uid'];
+    }
+  }
+
+  return NULL;
+}
+
+/**
+ * Creates a CAS user with the specified CAS username and roles.
+ *
+ * @param $cas_name
+ *   A string containing the CAS username.
+ * @param $cas_roles
+ *   An associative array whose keys are the role ids to assign.
+ */
+function _ucbldapcasuser_cas_create_user($cas_name, $cas_roles) {
+  $user_default = array(
+    "name" => $cas_name,
+    "pass" => user_password(),
+    "init" => db_escape_string($cas_name),
+    "status" => 1,
+    "roles" => $cas_roles,
+  );
+  if (!$cas_authmap) $user_default['authname_cas'] = $cas_name;
+  if ($cas_domain) $user_default['mail'] = $cas_name .'@'. $cas_domain;
+
+  $user_old = $user;
+  session_save_session(FALSE);
+
+  $user = user_save("", $user_default);
+  $edit = array();
+
+  $_SESSION['cas_first_login'] = TRUE;
+  user_module_invoke('login', $edit, $user);
+  unset($_SESSION['cas_first_login']);
+
+  $user = $user_old;
+  session_save_session(TRUE);
+}
+
+/**
+ * Returns a list of automatically assigned CAS user roles.
+ *
+ * Can be configured through the CAS.module user settings.
+ *
+ * @return
+ *   Returns an associative array with the automatically assigned roles, where
+ *   the role id is the key and the role name is the value.
+ */
+function _ucbldapcasuser_cas_roles() {
+  $all_roles = user_roles(TRUE);
+  $cas_roles = array();
+  foreach ($all_roles as $key => $value) {
+    if (array_key_exists($key, variable_get('cas_auto_assigned_role', array(DRUPAL_AUTHENTICATED_RID)))) {
+      $cas_roles[$key] = $value;
+    }
+  }
+  return $cas_roles;
+}
