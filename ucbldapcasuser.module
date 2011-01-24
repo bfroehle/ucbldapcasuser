@@ -83,6 +83,9 @@ function ucbldapcasuser_lookup(&$form_state) {
         }
       }
     }
+    if ($entries['count'] == $entries['max_count']) {
+      $form['cas_uids']['#description'] = '<div class="warning">' . t('Showing a maximum of %max_count results. Please refine your search.', array('%max_count' => $entries['max_count'])) . '</div>';
+    }
 
     // This is mostly taken from user.module, to provide an interface
     // consistent with the user edit form.
@@ -136,6 +139,7 @@ function ucbldapcasuser_lookup_validate($form, &$form_state) {
     $ldap_server = 'ldap.berkeley.edu';
     $ldap_port = 389;
     $base_dn = 'ou=people,dc=berkeley,dc=edu';
+    $max_count = 15;
 
     // Generate the query string.
     switch ($form_state['values']['search_type']) {
@@ -155,7 +159,7 @@ function ucbldapcasuser_lookup_validate($form, &$form_state) {
     }
 
     // Query the LDAP server.
-    $ldap_result = ldap_search($ldap_connection, $base_dn, $filter, array('uid', 'cn'));
+    $ldap_result = ldap_search($ldap_connection, $base_dn, $filter, array('uid', 'cn'), 0, $max_count);
     if (ldap_count_entries($ldap_connection, $ldap_result) == 0) {
       form_set_error('search_base', t('LDAP returned no entries for @filter on @server:@port', array('@filter' => $filter, '@server' => $ldap_server, '@port' => $ldap_port)));
       return;
@@ -163,6 +167,8 @@ function ucbldapcasuser_lookup_validate($form, &$form_state) {
 
     // Save the LDAP results for use in stage 2.
     $form_state['entries'] = ldap_get_entries($ldap_connection, $ldap_result);
+    $form_state['entries']['max_count'] = $max_count;
+
     return;
   }
   elseif ($form_state['clicked_button']['#value'] == t('Create users')) {
